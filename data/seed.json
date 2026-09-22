@@ -4,6 +4,8 @@
   "reminderHour": 16,
   "saturdayHour": 20,
   "sundayHour": 17,
+  "overdueMorningHour": 8,
+  "overdueEveningHour": 18,
   "people": [
     {
       "id": "a",

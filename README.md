@@ -15,7 +15,9 @@ signs in with a token.
 
 - **Friday afternoon** each person gets a push listing the chores they owe that
   weekend, with the how-to steps for each one. A **Saturday-night** nudge and a
-  **Sunday 5pm** last call chase whatever is still outstanding.
+  **Sunday 5pm** last call chase whatever is still outstanding. Anything still
+  not done once Sunday is over is **past due**, and gets chased at **8am and
+  6pm every day** until it is.
 - **Tap a chore off** in the app. It records who did it and when, the next turn
   goes to the other person, and you get a small celebration on screen.
 - **History** is the permanent record — and because every change is a git
@@ -102,23 +104,40 @@ system asks for reduced motion.
 
 ## Reminders
 
-Three per weekend, each only chasing what is still outstanding — whoever has
-finished hears nothing more:
+Every stage only chases what is still outstanding — whoever has finished hears
+nothing more:
 
 | Stage | When (local) | Says |
 | --- | --- | --- |
 | `friday` | Friday, `reminderHour` (4pm) | the weekend's list, with how-to steps |
 | `saturday` | Saturday, `saturdayHour` (8pm) | what's left, due tomorrow |
 | `sunday` | Sunday, `sundayHour` (5pm) | last call, finish tonight |
+| `overdue-<day>-am/pm` | Mon–Thu at `overdueMorningHour` (8am) and `overdueEveningHour` (6pm), plus Friday at 8am | past due, the list, and that we agreed on Sunday |
+
+The first three chase the weekend **in progress**. The overdue ones chase the
+weekend that has already **ended** — so on a Wednesday they list what was due
+last Sunday, not what the coming weekend will bring. Finishing a chore pushes
+its due date a full cycle forward, which drops it out of the overdue list by
+itself; when someone's list is empty they stop hearing anything.
+
+They run Monday 8am through Friday 8am. Friday gets a morning nudge only: the
+new weekend list lands that afternoon carrying the same tasks, marked how many
+days overdue they are, so an evening repeat would only say it all again.
 
 
 The cron lives in the **data** repo (`.github/workflows/remind.yml`, created
 from `template/`). It checks out this repo for the code and runs hourly from
-Friday evening UTC through Monday's small hours;
-`scripts/send-reminders.mjs` works out which stage the current *local* moment
-belongs to, from `timezone` and the three hour settings in the data repo's
-`state.json`. Daylight saving is therefore a non-issue and the cron never needs
-editing.
+Friday evening UTC through Monday's small hours, then four times a day
+Monday–Friday for the past-due nudges. `scripts/send-reminders.mjs` works out
+which stage the current *local* moment belongs to, from `timezone` and the hour
+settings in the data repo's `state.json`.
+
+The weekend lines never need editing — they run hourly, so daylight saving
+cannot shift them. The weekday lines are the exception: they fire at the two
+UTC hours that mean 8am and 6pm in `America/New_York` in either half of the
+year, because running hourly all week would spend a lot of Actions minutes on a
+private repo. Edit those two lines if you change `timezone`,
+`overdueMorningHour` or `overdueEveningHour`.
 
 It records who it has told for each stage, so a run delayed by GitHub still
 lands exactly once. Earlier stages are marked superseded when a later one goes
@@ -131,10 +150,11 @@ Preview what the notifications will say, without sending anything:
 CLEANIT_DATA_DIR=../cleanit-data/data npm run remind -- --dry-run
 ```
 
-Add `--stage=saturday` (or `friday`/`sunday`) to preview a specific one, and
-`CLEANIT_NOW=2026-09-19T24:00:00Z` to pretend it is another moment.
+Add `--stage=saturday` (or `friday`/`sunday`/`overdue`) to preview a specific
+one, and `CLEANIT_NOW=2026-09-22T12:00:00Z` to pretend it is another moment —
+useful for the overdue stages, which only exist Monday to Friday.
 
-Send one right now (Actions tab → Weekend reminders → Run workflow) if you want
+Send one right now (Actions tab → Chore reminders → Run workflow) if you want
 to test on a real phone.
 
 ## Local development
@@ -176,7 +196,7 @@ schedule.js                        due dates and rotation, shared by app and cro
 config.js                          data repo + VAPID public key (written by setup)
 sw.js  manifest.webmanifest        service worker and PWA install metadata
 data/seed.json                     starting chore template, no personal data
-scripts/send-reminders.mjs         builds and sends the Friday push
+scripts/send-reminders.mjs         builds and sends the push reminders
 scripts/setup.mjs                  creates both repos and wires them together
 template/                          scaffold for the private data repo
 .github/workflows/deploy.yml       publishes the app to Pages
@@ -188,5 +208,5 @@ The data repo (private):
 data/state.json                    people, tasks, and the completion log
 data/subscriptions.json            one push subscription per person
 data/reminders-sent.json           dedupe marker for the cron
-.github/workflows/remind.yml       hourly Friday cron; checks out this repo
+.github/workflows/remind.yml       weekend + past-due cron; checks out this repo
 ```

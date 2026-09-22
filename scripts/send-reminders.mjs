@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 /**
- * Sends each person the chores they still owe this weekend, in three stages:
+ * Sends each person the chores they still owe, in stages:
  *
  *   friday    the weekend's list, with the how-to steps
  *   saturday  what is still outstanding, due tomorrow
  *   sunday    final call, must be finished tonight
+ *   overdue   Monday 8am through Friday 8am, twice a day, once the Sunday
+ *             deadline has passed and something is still not done
  *
  * Anyone who has already finished gets nothing — the later stages only chase
  * what is actually left.
@@ -24,7 +26,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import webpush from 'web-push';
-import { weekendPlan, zonedParts } from '../schedule.js';
+import { weekendPlan, overduePlan, zonedParts } from '../schedule.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DRY = process.argv.includes('--dry-run');
@@ -49,44 +51,84 @@ const sentLog = JSON.parse(fs.readFileSync(SENT_PATH, 'utf8'));
 
 const now = process.env.CLEANIT_NOW ? new Date(process.env.CLEANIT_NOW) : new Date();
 const tz = state.timezone || 'UTC';
-const plan = weekendPlan(state, now);
 
 /* ---------- which stage is it? ---------- */
 
-// Position within the weekend: Friday 0, Saturday 1, Sunday 2.
-const DAY_INDEX = { 5: 0, 6: 1, 0: 2 };
+/*
+ * The cycle runs Friday -> Friday, because Friday afternoon is when a new
+ * weekend's list replaces the old one. Position 0 is Friday, 6 is Thursday,
+ * and 7 is the *following* Friday morning — still part of the outgoing cycle,
+ * since the new list has not gone out yet.
+ *
+ * Friday afternoon through Sunday, the three weekend stages are in play.
+ * Monday through Friday morning, the overdue ones are. The two spans do not
+ * overlap, so a single run is only ever one kind or the other.
+ */
+const WEEK_POS = { 5: 0, 6: 1, 0: 2, 1: 3, 2: 4, 3: 5, 4: 6 };
 
-const STAGES = [
-  { id: 'friday', day: 0, hour: state.reminderHour ?? 16 },
-  { id: 'saturday', day: 1, hour: state.saturdayHour ?? 20 },
-  { id: 'sunday', day: 2, hour: state.sundayHour ?? 17 },
+const fridayHour = state.reminderHour ?? 16;
+const morningHour = state.overdueMorningHour ?? 8;
+const eveningHour = state.overdueEveningHour ?? 18;
+
+// Sort key: hours since Friday 00:00 local.
+const at = (s) => s.pos * 24 + s.hour;
+
+const WEEKEND_STAGES = [
+  { id: 'friday', pos: 0, hour: fridayHour, kind: 'weekend' },
+  { id: 'saturday', pos: 1, hour: state.saturdayHour ?? 20, kind: 'weekend' },
+  { id: 'sunday', pos: 2, hour: state.sundayHour ?? 17, kind: 'weekend' },
 ];
 
-const localNow = zonedParts(now, tz);
-const todayIndex = DAY_INDEX[localNow.weekday];
+// Twice a day while anything is still past due. Friday gets a morning nudge
+// only: the weekend list lands that afternoon carrying the same tasks, marked
+// overdue, so an evening one would just say it all again.
+const OVERDUE_STAGES = [['mon', 3], ['tue', 4], ['wed', 5], ['thu', 6], ['fri', 7]]
+  .flatMap(([day, pos]) =>
+    (pos === 7 ? [['am', morningHour]] : [['am', morningHour], ['pm', eveningHour]])
+      .map(([slot, hour]) => ({ id: `overdue-${day}-${slot}`, pos, hour, kind: 'overdue' }))
+  );
 
-const hasTriggered = (stage) =>
-  todayIndex !== undefined &&
-  (todayIndex > stage.day || (todayIndex === stage.day && localNow.hour >= stage.hour));
+const STAGES = [...WEEKEND_STAGES, ...OVERDUE_STAGES].sort((a, b) => at(a) - at(b));
+
+const localNow = zonedParts(now, tz);
+const rawPos = WEEK_POS[localNow.weekday];
+// Friday before the new list goes out belongs to the tail of the old cycle.
+const nowPos = rawPos === 0 && localNow.hour < fridayHour ? 7 : rawPos;
+const nowAt = nowPos * 24 + localNow.hour;
+const kind = nowPos <= 2 ? 'weekend' : 'overdue';
+
+const inPlay = STAGES.filter((s) => s.kind === kind);
 
 // The most recent stage whose moment has passed. Anything earlier is stale:
 // if Friday's run was missed, Saturday's message is the one worth sending.
-const currentStage = [...STAGES].reverse().find(hasTriggered);
+const currentStage = inPlay.filter((s) => at(s) <= nowAt).pop();
+
+// `--stage=overdue` is an alias, since the overdue stages are per-day.
 const stage = stageOverride
-  ? STAGES.find((s) => s.id === stageOverride)
+  ? (stageOverride === 'overdue'
+      ? STAGES.filter((s) => s.kind === 'overdue' && at(s) <= nowAt).pop()
+        ?? STAGES.find((s) => s.id === 'overdue-mon-am')
+      : STAGES.find((s) => s.id === stageOverride))
   : currentStage;
 
 if (!stage) {
   console.log(
     `Nothing due yet (${tz} says day ${localNow.weekday}, hour ${localNow.hour}). ` +
-    `First reminder goes out Friday at ${STAGES[0].hour}:00.`
+    (kind === 'weekend'
+      ? `The weekend list goes out Friday at ${fridayHour}:00.`
+      : `The next overdue nudge is at ${morningHour}:00.`)
   );
   process.exit(0);
 }
 
-// Every stage up to and including this one counts as handled, so a stale
-// earlier message can never arrive late.
-const supersededIds = STAGES.slice(0, STAGES.findIndex((s) => s.id === stage.id) + 1)
+const plan = stage.kind === 'overdue' ? overduePlan(state, now) : weekendPlan(state, now);
+
+// Every stage of the same kind up to and including this one counts as handled,
+// so a stale earlier message can never arrive late. Weekend and overdue stages
+// never supersede each other — they chase different deadlines.
+const sameKind = STAGES.filter((s) => s.kind === stage.kind);
+const supersededIds = sameKind
+  .slice(0, sameKind.findIndex((s) => s.id === stage.id) + 1)
   .map((s) => s.id);
 
 /* ---------- the message ---------- */
@@ -104,6 +146,9 @@ function clip(text, limit) {
   return t.slice(0, limit).replace(/\s+\S*$/, '') + '…';
 }
 
+// The Sunday the overdue stages are measuring against.
+const dl = zonedParts(plan.window.end, tz);
+
 const COPY = {
   friday: (n) => ({
     title: n === 1 ? '1 chore this weekend' : `${n} chores this weekend`,
@@ -117,12 +162,20 @@ const COPY = {
     title: n === 1 ? 'Last call: 1 chore' : `Last call: ${n} chores`,
     lead: 'These need to be finished by tonight, as agreed.',
   }),
+  // Day-agnostic on purpose: a run delayed from Tuesday evening to Wednesday
+  // morning still reads correctly.
+  overdue: (n) => ({
+    title: n === 1 ? '1 chore past due' : `${n} chores past due`,
+    lead: `Past due. These were due by Sunday ${dl.month}/${dl.day} and still aren't done:`,
+    tail: 'We agreed everything gets done by Sunday. Please do these today.',
+  }),
 };
 
 function buildMessage(personId, items) {
-  const { title, lead } = COPY[stage.id](items.length);
+  const { title, lead, tail } = COPY[stage.kind === 'overdue' ? 'overdue' : stage.id](items.length);
   const names = items.map((a) => `• ${a.task.name}`).join('\n');
   let body = `${lead}\n${names}`;
+  if (tail) body += `\n\n${tail}`;
 
   for (const a of items) {
     const how = clip(a.task.instructions, MAX_INSTRUCTIONS_PER_TASK);
@@ -156,7 +209,11 @@ if (!DRY) {
   webpush.setVapidDetails(subject, pub, priv);
 }
 
-console.log(`Stage: ${stage.id} (weekend of ${weekendKey}, ${tz})`);
+console.log(
+  `Stage: ${stage.id} (` +
+  (stage.kind === 'overdue' ? `past due since ${dl.month}/${dl.day}, ` : '') +
+  `weekend of ${weekendKey}, ${tz})`
+);
 
 let sent = 0;
 let pruned = false;

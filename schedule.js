@@ -54,6 +54,18 @@ export function startOfDay(now, tz) {
   return zonedToInstant(p.year, p.month, p.day, 0, 0, 0, tz);
 }
 
+// Days back to the Friday of the weekend in progress: Fri=0, Sat=1, Sun=2.
+// Monday–Thursday there is none, and the caller decides which way to look.
+const BACK_TO_FRIDAY = { 5: 0, 6: 1, 0: 2 };
+
+// Friday 00:00 through Sunday 23:59:59 local, `shift` days from `p`'s date.
+function windowFrom(p, shift, tz) {
+  return {
+    start: zonedToInstant(p.year, p.month, p.day + shift, 0, 0, 0, tz),
+    end: zonedToInstant(p.year, p.month, p.day + shift + 2, 23, 59, 59, tz),
+  };
+}
+
 /**
  * The weekend that `now` belongs to or is about to run into.
  * Friday 00:00 through Sunday 23:59:59 local. Monday–Thursday look ahead to
@@ -61,12 +73,21 @@ export function startOfDay(now, tz) {
  */
 export function weekendWindow(now, tz) {
   const p = zonedParts(now, tz);
-  // Days back to Friday (weekday 5): Fri=0, Sat=1, Sun=2, Mon..Thu look forward.
-  const backToFriday = { 5: 0, 6: 1, 0: 2 }[p.weekday];
+  const backToFriday = BACK_TO_FRIDAY[p.weekday];
   const shift = backToFriday !== undefined ? -backToFriday : 5 - p.weekday;
-  const start = zonedToInstant(p.year, p.month, p.day + shift, 0, 0, 0, tz);
-  const end = zonedToInstant(p.year, p.month, p.day + shift + 2, 23, 59, 59, tz);
-  return { start, end };
+  return windowFrom(p, shift, tz);
+}
+
+/**
+ * The most recent weekend that has already *finished* — the deadline the
+ * overdue reminders chase. Monday–Thursday that is the weekend just gone;
+ * Friday–Sunday the current one is still running, so it is the one before.
+ */
+export function lastWeekendWindow(now, tz) {
+  const p = zonedParts(now, tz);
+  const backToFriday = BACK_TO_FRIDAY[p.weekday];
+  const shift = backToFriday !== undefined ? -backToFriday - 7 : -(p.weekday + 2);
+  return windowFrom(p, shift, tz);
 }
 
 /* ---------- state queries ---------- */
@@ -176,10 +197,7 @@ export function dueBy(state, cutoff) {
     .sort((x, y) => (x.dueAt?.getTime() ?? 0) - (y.dueAt?.getTime() ?? 0));
 }
 
-/** What each person owes for the weekend `now` falls into. */
-export function weekendPlan(state, now = new Date()) {
-  const tz = state.timezone || 'UTC';
-  const window = weekendWindow(now, tz);
+function planFor(state, window) {
   const due = dueBy(state, window.end);
   return {
     window,
@@ -187,6 +205,24 @@ export function weekendPlan(state, now = new Date()) {
       state.people.map((p) => [p.id, due.filter((a) => a.personId === p.id)])
     ),
   };
+}
+
+/** What each person owes for the weekend `now` falls into. */
+export function weekendPlan(state, now = new Date()) {
+  const tz = state.timezone || 'UTC';
+  return planFor(state, weekendWindow(now, tz));
+}
+
+/**
+ * What each person still owes from the weekend that has already ended — the
+ * genuinely past-due work, as opposed to what the coming weekend will bring.
+ *
+ * Anything finished since the deadline falls out on its own: completing a task
+ * pushes its due date a full cycle forward, past this window's end.
+ */
+export function overduePlan(state, now = new Date()) {
+  const tz = state.timezone || 'UTC';
+  return planFor(state, lastWeekendWindow(now, tz));
 }
 
 /* ---------- mutation ---------- */
